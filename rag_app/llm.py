@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Dict, Sequence, Tuple
 import requests
 from .config import SETTINGS
+from .messages import NO_ANSWER, no_answer_response
 from .interfaces import IChatLLM, IQueryRewriter, IAnswerGenerator, DocumentChunk
 
 
@@ -15,7 +16,16 @@ You are a strict relevance grader. Given a user question and a context chunk, re
 """.strip()
 
 SYSTEM_ANSWER = """
-You are a professional assistant that answers questions ONLY using the provided document context below. Do not use any external knowledge or assumptions. If the information is not in the context, say "I don't know based on the document." Be precise, logical, and professional. Include page numbers in parentheses like (p. 12) only when citing specific facts from the context. Explain connections and suggest follow-up questions based on the context.
+You are a professional assistant that answers questions ONLY using the provided document context below. Do not use any external knowledge or assumptions.
+
+If the answer is not present in the context, respond kindly and professionally with a brief, interactive clarification tailored to the user's question (e.g., ask for a page/section or keywords). Do not include citations in this case, and vary the wording naturally.
+
+Citation policy:
+- Include page numbers in parentheses like (p. 12) ONLY when citing specific facts that are explicitly present in the provided context snippets.
+- Never invent or infer page numbers.
+- Do NOT include citations for metadata-only facts or structural/TOC information; cite only text-derived content present in the snippets.
+
+Explain connections and suggest follow-up questions based on the context.
 
 Context:
 {context}
@@ -84,12 +94,12 @@ class OllamaChat(IChatLLM):
 class MockChat(IChatLLM):
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.0, max_tokens: int | None = None) -> str:
         # Very small rule-based output for tests
-        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         if "relevant?" in last_user.lower():
             return "YES"
-        if "rewrite" in (messages[0].get("content", "").lower() if messages else ""):
+        if messages and "rewrite" in (messages[0].get("content", "").lower()):
             return last_user
-        return "I don't know based on the document."
+        return no_answer_response(last_user)
 
 
 class FallbackChat(IChatLLM):

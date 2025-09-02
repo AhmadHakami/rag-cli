@@ -20,6 +20,7 @@ from .llm import relevance_yes_no
 from .lexical_index import LexicalIndex
 from .structural_index import StructuralIndex
 from . import cache as cache_util
+from .messages import NO_ANSWER, no_answer_response
 
 
 @dataclass
@@ -187,9 +188,26 @@ class AgenticRAG:
     # --- Routing and direct answerers ---
     def _route_query(self, q: str) -> str:
         ql = q.lower()
-        if any(k in ql for k in ["how many times", "frequency of", "count of", "how often", "how many times is", "how many times was", "word count"]):
+        if any(k in ql for k in [
+            "how many times",
+            "frequency of",
+            "count of",
+            "how often",
+            "word count",
+            "occurrence of",
+            "mentioned",
+        ]):
             return "lexical"
-        if any(k in ql for k in ["table of contents", "toc", "section", "page number of", "which page", "pages for", "page of"]):
+        if any(k in ql for k in [
+            "table of contents",
+            "toc",
+            "section",
+            "sections",
+            "page number of",
+            "which page",
+            "pages for",
+            "page of",
+        ]):
             return "structural"
         return "semantic"
 
@@ -203,12 +221,13 @@ class AgenticRAG:
             words = re.findall(r"[\w']+", q.lower())
             term = words[-1] if words else ""
         if not term:
-            return "I don't know based on the document."
+            return no_answer_response(q)
         per_page = self.lex_index.term_frequency_by_page(term)
         total = sum(per_page.values())
         if total == 0:
-            return "I don't know based on the document."
+            return no_answer_response(q)
         parts = [f"p.{p}: {c}" for p, c in sorted(per_page.items())]
+        # Lexical answers are direct counts from the keyword index; avoid LLM-style citations
         return f"'{term}' appears {total} times across pages: " + ", ".join(parts)
 
     def _answer_structural(self, q: str) -> str:
@@ -222,7 +241,7 @@ class AgenticRAG:
         ):
             toc = self.struct_index.toc()
             if not toc:
-                return "I don't know based on the document."
+                return no_answer_response(q)
             items = [f"{k}: pages {', '.join(str(p) for p in v)}" for k, v in toc.items()]
             return "Table of Contents:\n" + "\n".join(items)
         import re
@@ -231,16 +250,38 @@ class AgenticRAG:
             topic = m.group(1).strip()
             pages = self.struct_index.pages_for(topic)
             if not pages:
-                return "I don't know based on the document."
+                return no_answer_response(q)
+            # Structural answers reflect metadata/TOC; do not add (p.X) citations
             return f"The page number(s) for '{topic}' are: {', '.join(str(p) for p in pages)}"
         m2 = re.search(r"section\s+(.+)$", ql)
         if m2:
             section = m2.group(1).strip()
             pages = self.struct_index.pages_for(section)
             if not pages:
-                return "I don't know based on the document."
+                return no_answer_response(q)
             return f"Section '{section}' is on pages: {', '.join(str(p) for p in pages)}"
-        return "I don't know based on the document."
+
+        # Chain: ask for pages for a topic then summarize that section
+        if "summary of" in ql or ("main idea" in ql and "section" in ql):
+            import re as _re
+            m3 = _re.search(r"section\s+(.+?)($|\?|\.|,)", ql)
+            target = m3.group(1).strip() if m3 else ""
+            if not target:
+                return no_answer_response(q)
+            pages = self.struct_index.pages_for(target)
+            if not pages:
+                return no_answer_response(q)
+            # retrieve chunks on those pages and summarize with LLM
+            ctx = [c for c in self.store.metadatas if c.page_number in set(pages)]
+            if not ctx:
+                return no_answer_response(q)
+            prompt = (
+                f"Summarize the key points of section '{target}'. "
+                f"Base your answer strictly on the provided snippets. Include (p.X) citations only for facts explicitly present in the snippets.\n\n"
+                + "\n\n".join(f"(p.{c.page_number}) {c.text}" for c in ctx[:8])
+            )
+            return self.llm.chat([{"role": "user", "content": prompt}], max_tokens=400)
+        return no_answer_response(q)
 
     def summarize_document(self) -> str:
         """Generate a logical, deep summary of the entire document for understanding before Q&A."""
