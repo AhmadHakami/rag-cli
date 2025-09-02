@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag_app"
+version = "0.1.0"
+description = "Agentic RAG with page citations and provider abstraction"
+requires-python = ">=3.10"
+dependencies = [
+    "tqdm>=4.66.0",
+    "python-dotenv>=1.0.1",
+    "pydantic>=2.7.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.3.2",
+    "pypdf>=4.2.0",
+    "requests>=2.31.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
