@@ -4,3 +4,4 @@ __pycache__/
 .env
 .cache/
 .rag_cache/
+{new_directory}

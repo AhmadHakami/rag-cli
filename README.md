@@ -20,7 +20,7 @@ An advanced, SOLID-architected Retrieval Augmented Generation (RAG) app that:
 
 ## Quick Start
 
-1) Install dependencies
+1) Install dependencies with python 3.10
 
 ```bash
 python -m venv .venv

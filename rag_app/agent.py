@@ -111,11 +111,13 @@ class AgenticRAG:
             # Step 5: index (lexical/structural)
             pbar.set_description("Ingestion: building indexes")
             self.lex_index.add_chunks(chunks)
-            for c in chunks:
-                first_line = c.text.strip().split("\n")[0]
-                if 0 < len(first_line) <= 80:
-                    if first_line.endswith(":") or first_line.istitle():
-                        self.struct_index.add_heading(first_line.rstrip(":"), c.page_number)
+
+            # Build structural index from PDF headings stored in metadata
+            if 'headings' in metadata:
+                for page_num, headings in metadata['headings'].items():
+                    for heading in headings:
+                        self.struct_index.add_heading(heading, page_num)
+
             pbar.set_postfix(indexed_pages=len({c.page_number for c in chunks}))
             pbar.update(1)
 
@@ -134,6 +136,27 @@ class AgenticRAG:
             return len(chunks)
 
     def ask(self, question: str) -> str:
+        # Handle metadata questions directly
+        ql = question.lower()
+        if "title" in ql and ("document" in ql or "paper" in ql or "what is" in ql):
+            title = self.store.metadata.get("Title", "")
+            if title:
+                return f"The title of the document is: {title}"
+            else:
+                return no_answer_response(question)
+        elif ("author" in ql or "who" in ql) and ("wrote" in ql or "is" in ql):
+            author = self.store.metadata.get("Author", "")
+            if author:
+                return f"The author of the document is: {author}"
+            else:
+                return no_answer_response(question)
+        elif "how many" in ql and "pages" in ql:
+            pages = self.store.metadata.get("Pages", 0)
+            if pages:
+                return f"The document has {pages} pages."
+            else:
+                return no_answer_response(question)
+
         # Progress across: rewrite -> embed query -> retrieve -> grade -> answer
         steps = ["rewrite", "route", "retrieve", "grade", "answer"]
         with tqdm(total=len(steps), desc="Query", unit="step") as pbar:
@@ -207,6 +230,14 @@ class AgenticRAG:
             "which page",
             "pages for",
             "page of",
+            "extract content",
+            "content of page",
+            "extract page",
+            "get page",
+            "show page",
+            "read page",
+            "related to",
+            "page is",
         ]):
             return "structural"
         return "semantic"
@@ -253,6 +284,18 @@ class AgenticRAG:
                 return no_answer_response(q)
             # Structural answers reflect metadata/TOC; do not add (p.X) citations
             return f"The page number(s) for '{topic}' are: {', '.join(str(p) for p in pages)}"
+        
+        # Handle "which page" questions
+        m_page = re.search(r"which page(?:s)?(?:\s+is|\s+are)?(?:\s+related to|\s+contains|\s+has|\s+for)?\s+(.+?)(?:\s+section|\s+part|\?|$)", ql)
+        if m_page:
+            topic = m_page.group(1).strip()
+            # Clean up the topic
+            topic = re.sub(r'^(the\s+)', '', topic)  # Remove leading "the"
+            pages = self.struct_index.pages_for(topic)
+            if not pages:
+                return no_answer_response(q)
+            return f"The {topic} section is on page(s): {', '.join(str(p) for p in pages)}"
+        
         m2 = re.search(r"section\s+(.+)$", ql)
         if m2:
             section = m2.group(1).strip()
@@ -261,26 +304,31 @@ class AgenticRAG:
                 return no_answer_response(q)
             return f"Section '{section}' is on pages: {', '.join(str(p) for p in pages)}"
 
-        # Chain: ask for pages for a topic then summarize that section
-        if "summary of" in ql or ("main idea" in ql and "section" in ql):
-            import re as _re
-            m3 = _re.search(r"section\s+(.+?)($|\?|\.|,)", ql)
-            target = m3.group(1).strip() if m3 else ""
-            if not target:
-                return no_answer_response(q)
-            pages = self.struct_index.pages_for(target)
+        # Handle page content extraction
+        m3 = re.search(r"(?:extract|get|show|read|what(?:'s| is))\s+(?:the\s+)?(?:content|text|summary)\s+(?:of\s+)?(?:page\s+)?(\d+)", ql)
+        if m3:
+            page_num = int(m3.group(1))
+            # Find chunks from this page
+            page_chunks = [c for c in self.store.metadatas if c.page_number == page_num]
+            if not page_chunks:
+                return f"I couldn't find content for page {page_num}. The document may have {self.store.metadata.get('Pages', 'unknown')} pages."
+            # Combine all chunks from this page
+            full_content = "\n\n".join(c.text for c in page_chunks)
+            return f"Content of page {page_num}:\n\n{full_content}"
+
+        # Handle section content extraction
+        m4 = re.search(r"(?:extract|get|show|read|what(?:'s| is))\s+(?:the\s+)?(?:full\s+)?(?:content|text|summary)\s+(?:of\s+)?(?:the\s+)?(\w+)\s+section", ql)
+        if m4:
+            section = m4.group(1)
+            pages = self.struct_index.pages_for(section)
             if not pages:
                 return no_answer_response(q)
-            # retrieve chunks on those pages and summarize with LLM
-            ctx = [c for c in self.store.metadatas if c.page_number in set(pages)]
-            if not ctx:
-                return no_answer_response(q)
-            prompt = (
-                f"Summarize the key points of section '{target}'. "
-                f"Base your answer strictly on the provided snippets. Include (p.X) citations only for facts explicitly present in the snippets.\n\n"
-                + "\n\n".join(f"(p.{c.page_number}) {c.text}" for c in ctx[:8])
-            )
-            return self.llm.chat([{"role": "user", "content": prompt}], max_tokens=400)
+            # Get content from the first page of this section
+            page_chunks = [c for c in self.store.metadatas if c.page_number == pages[0]]
+            if not page_chunks:
+                return f"I found the {section} section on page {pages[0]}, but couldn't retrieve the content."
+            full_content = "\n\n".join(c.text for c in page_chunks)
+            return f"Content of {section} section (page {pages[0]}):\n\n{full_content}"
         return no_answer_response(q)
 
     def summarize_document(self) -> str:
