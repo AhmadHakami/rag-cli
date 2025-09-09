@@ -18,20 +18,23 @@ You are a strict relevance grader. Given a user question and a context chunk, re
 SYSTEM_ANSWER = """
 You are a professional assistant that answers questions ONLY using the provided document context below. Do not use any external knowledge or assumptions.
 
-If the answer is not present in the context, respond kindly and professionally with a brief, interactive clarification tailored to the user's question (e.g., ask for a page/section or keywords). Do not include citations in this case, and vary the wording naturally.
+If the answer is not present in the context, respond kindly and professionally with a brief, interactive clarification tailored to the user's question (e.g., ask for a page/section or keywords). Do not invent information.
 
-Citation policy:
-- Include page numbers in parentheses like (p. 12) ONLY when citing specific facts that are explicitly present in the provided context snippets.
-- Never invent or infer page numbers.
-- Do NOT include citations for metadata-only facts or structural/TOC information; cite only text-derived content present in the snippets.
+Citation policy (mandatory):
+- For any factual claim taken from a context chunk, add an inline citation of the form (p. N) where N is the exact page_number from the chunk.
+- If a claim is supported by multiple chunks from different pages, include multiple citations like (p. 3; p. 5).
+- Never invent page numbers. If the supporting chunk has no page information, do not add a page citation.
+- For structural answers (TOC, page numbers for sections, metadata like Title/Author), you may return the result without (p.N) citations.
 
-Explain connections and suggest follow-up questions based on the context.
+Also:
+- At the end of the answer, include a short "Sources:" list with entries like "p. N: <first 80 chars of chunk>..." for each chunk used in the answer.
+- Preserve the user's question and, when available, use the chat history to resolve follow-ups and coreferences.
 
 Context:
 {context}
 
 Question: {question}
-""".strip()
+"""
 
 
 class OpenAIChat(IChatLLM):
@@ -138,15 +141,70 @@ class AnswerGenerator(IAnswerGenerator):
     def __init__(self, llm: IChatLLM):
         self.llm = llm
 
-    def answer(self, question: str, contexts: Sequence[DocumentChunk]) -> str:
+    def answer(self, question: str, contexts: Sequence[DocumentChunk], chat_history: Sequence[Tuple[str, str]] | None = None) -> str:
         joined = []
         for c in contexts:
-            joined.append(f"[p.{c.page_number}] {c.text}")
+            # include section if present for better grounding
+            sec = f"[{c.section}] " if getattr(c, 'section', None) else ""
+            joined.append(f"[p.{c.page_number}] {sec}{c.text}")
         context_text = "\n---\n".join(joined)
+        # If chat_history exists, include as system context to help with follow-ups
+        history_text = "\n".join([f"User: {u}\nAssistant: {a}" for u, a in (chat_history or [])])
+        system_content = SYSTEM_ANSWER.format(context=context_text, question=question)
+        if history_text:
+            system_content = f"Previous interaction history:\n{history_text}\n\n" + system_content
         messages = [
-            {"role": "user", "content": SYSTEM_ANSWER.format(context=context_text, question=question)},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": "Please answer using the context above. Use inline citations and list sources at the end."},
         ]
-        return self.llm.chat(messages)
+        out = self.llm.chat(messages)
+
+        # Post-process: if the model didn't include any (p. N) citations, try to inject them deterministically
+        import re
+
+        def _token_set(text: str) -> set:
+            return set(re.findall(r"\w{3,}", text.lower()))
+
+        def _inject_citations(answer_text: str, contexts: Sequence[DocumentChunk]) -> str:
+            # Build token sets for contexts
+            ctx_tokens = {}
+            for c in contexts:
+                ctx_tokens.setdefault(c.page_number, set()).update(_token_set(c.text))
+
+            # Split answer into sentences
+            sents = re.split(r'(?<=[.!?])\s+', answer_text)
+            annotated = []
+            for s in sents:
+                if not s.strip():
+                    continue
+                stokens = _token_set(s)
+                # score pages by overlap
+                scores = []
+                for pnum, toks in ctx_tokens.items():
+                    overlap = len(stokens & toks)
+                    scores.append((overlap, pnum))
+                scores.sort(reverse=True)
+                if scores and scores[0][0] >= 3:
+                    # attach top page as citation
+                    top_pages = [str(p) for sc, p in scores if sc >= 3]
+                    citation = f" (p. {'; p. '.join(top_pages)})"
+                    annotated.append(s + citation)
+                else:
+                    annotated.append(s)
+            return " ".join(annotated)
+
+        if contexts and not re.search(r"\(p\.\s*\d+\)", out):
+            injected = _inject_citations(out, contexts)
+            # Append concise sources list
+            seen = []
+            srcs = []
+            for c in contexts:
+                if c.page_number not in seen:
+                    seen.append(c.page_number)
+                    snippet = (c.text.strip()[:80].replace('\n', ' ') + '...') if c.text else ''
+                    srcs.append(f"p. {c.page_number}: {snippet}")
+            out = injected.strip() + "\n\nSources:\n" + "\n".join(srcs)
+        return out
 
 
 def relevance_yes_no(llm: IChatLLM, question: str, chunk: DocumentChunk) -> bool:

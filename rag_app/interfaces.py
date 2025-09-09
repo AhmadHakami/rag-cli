@@ -44,5 +44,15 @@ class IQueryRewriter(Protocol):
 
 
 class IAnswerGenerator(Protocol):
-    def answer(self, question: str, contexts: Sequence[DocumentChunk]) -> str:
+    def answer(self, question: str, contexts: Sequence[DocumentChunk], chat_history: Sequence[Tuple[str, str]] | None = None) -> str:
+        """Generate an answer using provided contexts.
+
+        Args:
+            question: The (possibly rewritten) user question.
+            contexts: Sequence of DocumentChunk to use as evidence.
+            chat_history: Optional prior (question, answer) pairs to support follow-ups.
+
+        Returns:
+            A string reply. Implementations should include inline citations where appropriate.
+        """
         ...

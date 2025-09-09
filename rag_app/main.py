@@ -36,10 +36,19 @@ def main():
                 summary = agent.summarize_document()
                 print(f"\nSummary:\n{summary}")
             else:
+                # Support summarize with template: 'summarize: <template>'
+                if q.lower().startswith("summarize:"):
+                    template = q.split(":", 1)[1].strip()
+                    summary = agent.summarize_document(template=template)
+                    print(f"\nSummary:\n{summary}")
+                    continue
                 a = agent.ask(q)
                 print(f"\nA> {a}")
     except KeyboardInterrupt:
         print("\nBye")
+    except EOFError:
+        # When running non-interactively (here-doc), input() may raise EOFError.
+        print("\nExiting (EOF)")
 
 
 if __name__ == "__main__":

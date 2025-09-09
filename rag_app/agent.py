@@ -201,7 +201,7 @@ class AgenticRAG:
             pbar.update(1)
             # 6) answer
             pbar.set_description("Query: generating answer")
-            answer = self.answerer.answer(rewritten, relevant)
+            answer = self.answerer.answer(rewritten, relevant, chat_history=self._history)
             pbar.set_postfix_str("done")
             pbar.update(1)
 
@@ -316,44 +316,79 @@ class AgenticRAG:
             full_content = "\n\n".join(c.text for c in page_chunks)
             return f"Content of page {page_num}:\n\n{full_content}"
 
+        # Summarize a specific page
+        m3s = re.search(r"summarize\s+page\s+(\d+)", ql)
+        if m3s:
+            page_num = int(m3s.group(1))
+            page_chunks = [c for c in self.store.metadatas if c.page_number == page_num]
+            if not page_chunks:
+                return f"I couldn't find content for page {page_num}."
+            full_content = "\n\n".join(c.text for c in page_chunks)
+            return self.answerer.answer(f"Summarize the following page content:\n\n{full_content}", page_chunks, chat_history=self._history)
+
         # Handle section content extraction
-        m4 = re.search(r"(?:extract|get|show|read|what(?:'s| is))\s+(?:the\s+)?(?:full\s+)?(?:content|text|summary)\s+(?:of\s+)?(?:the\s+)?(\w+)\s+section", ql)
+        m4 = re.search(r"(?:extract|get|show|read|what(?:'s| is))\s+(?:the\s+)?(?:full\s+)?(?:content|text|summary)\s+(?:of\s+)?(?:the\s+)?([\w\- ]+)\s+section", ql)
         if m4:
             section = m4.group(1)
             pages = self.struct_index.pages_for(section)
             if not pages:
                 return no_answer_response(q)
-            # Get content from the first page of this section
-            page_chunks = [c for c in self.store.metadatas if c.page_number == pages[0]]
+            # Get content from all pages of this section
+            page_chunks = [c for c in self.store.metadatas if c.page_number in pages]
             if not page_chunks:
-                return f"I found the {section} section on page {pages[0]}, but couldn't retrieve the content."
+                return f"I found the {section} section on page(s) {', '.join(str(p) for p in pages)}, but couldn't retrieve the content."
             full_content = "\n\n".join(c.text for c in page_chunks)
-            return f"Content of {section} section (page {pages[0]}):\n\n{full_content}"
+            # If user asked for summary or full content, detect
+            if any(w in ql for w in ("summary", "summarize", "brief")):
+                return self.answerer.answer(f"Summarize the following section '{section}':\n\n{full_content}", page_chunks, chat_history=self._history)
+            return f"Content of {section} section (pages {', '.join(str(p) for p in pages)}):\n\n{full_content}"
         return no_answer_response(q)
 
-    def summarize_document(self) -> str:
-        """Generate a logical, deep summary of the entire document for understanding before Q&A."""
-        all_texts = [chunk.text for chunk in self.store.metadatas]
-        if not all_texts:
+    def summarize_document(self, template: str | None = None) -> str:
+        """Generate a logical, deep summary of the entire document.
+
+        For long documents, summarize page-by-page then synthesize to avoid token limits.
+        """
+        all_chunks = list(self.store.metadatas)
+        if not all_chunks:
             return "No document content available to summarize."
-        full_text = "\n".join(all_texts)
-        # Extract metadata if available
+
+        # Extract metadata
         metadata = getattr(self.store, 'metadata', {})
         title = metadata.get('Title', 'Unknown')
         author = metadata.get('Author', 'Unknown')
         subject = metadata.get('Subject', 'Unknown')
-        prompt = f"""
-Provide a comprehensive, logical summary of the following document. Include:
-- Document Type: Based on content, e.g., CV, Report, etc.
-- Title: {title}
-- Author: {author}
-- Subject: {subject}
-- Table of Contents: Extract or infer main sections/headings.
-- General Information: Key facts, dates, etc.
-- Structure the summary with sections for clarity.
 
-Document Text:
-{full_text[:8000]}  # Limit to avoid token overflow
-""".strip()
-        messages = [{"role": "user", "content": prompt}]
+        # Group chunks by page
+        pages = {}
+        for c in all_chunks:
+            pages.setdefault(c.page_number, []).append(c)
+
+        # If doc small, send full text in one shot
+        if len(pages) <= 4:
+            full_text = "\n".join(c.text for c in all_chunks)
+            base = f"Provide a comprehensive, logical summary of the following document. Include:\n- Document Type\n- Title: {title}\n- Author: {author}\n- Subject: {subject}\n- Table of Contents (brief)\n- Key findings and structure.\n\nDocument Text:\n{full_text[:8000]}"
+            prompt = f"{template}\n\n{base}" if template else base
+            messages = [{"role": "user", "content": prompt}]
+            return self.llm.chat(messages, max_tokens=1500)
+
+        # Otherwise summarize per page then synthesize
+        page_summaries = []
+        for pnum in sorted(pages.keys()):
+            page_text = "\n\n".join(c.text for c in pages[pnum])
+            # Ask the answerer to produce a short page summary
+            prompt = f"Summarize this page (p. {pnum}) in 2-3 concise bullets:\n\n{page_text[:6000]}"
+            # Use answerer to ensure citations and consistency
+            summary = self.answerer.answer(prompt, pages[pnum], chat_history=self._history)
+            page_summaries.append((pnum, summary))
+
+        # Synthesize page summaries into final document summary
+        synth_text = "\n\n".join(f"p. {p}: {s}" for p, s in page_summaries)
+        prefix = (template + "\n\n") if template else ""
+        base = (
+            f"Synthesize the following page summaries into a single executive summary. Include Document Type, Title: {title}, Author: {author}, a short Table of Contents, 3 key bullets, and a one-line takeaway.\n\n"
+            + prefix
+            + synth_text
+        )
+        messages = [{"role": "user", "content": base}]
         return self.llm.chat(messages, max_tokens=1500)
